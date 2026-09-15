@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
 #include "rng.h"
 #include "spi.h"
 #include "tim.h"
@@ -43,7 +44,7 @@
 #define TEXT_COLOUR     BLACK
 
 #define FONT_H(size)    (8 * (size))    /* CHAR_HEIGHT of 5x5_font.h */
-#define TOP_TEXT_SIZE   3               /* 18x24 px per char */
+#define TOP_TEXT_SIZE   2               /* 12x16 px per char */
 #define TOP_TEXT_Y      28
 #define TEMP_X          8
 #define HUMID_X         188
@@ -63,6 +64,9 @@
 
 #define TOUCH_MARGIN    10              /* extra px around a dot that still counts as a hit */
 #define STEP_PERCENT    10
+
+#define AM2320_ADDR     (0x5C << 1)
+#define AM2320_PERIOD   3000            /* ms, sensor needs > 2 s between reads */
 
 /* light tints used for the empty part of each bar */
 #define LIGHT_RED       0xFE38
@@ -85,9 +89,13 @@ static const uint16_t channel_light[CH_COUNT]  = { LIGHT_RED, LIGHT_GREEN, LIGHT
 
 static uint8_t rgb_percent[CH_COUNT] = { 0, 0, 0 };
 
-/* TODO: fill these from the AM2320 later */
-static float temperature = 0.0f;
-static float humidity    = 0.0f;
+/* latest AM2320 reading: t in degC, h in %RH */
+static float t = 0.0f;
+static float h = 0.0f;
+
+/* AM2320: function 0x03 (read registers), start at 0x00, read 4 bytes */
+static uint8_t cmdBuffer[3] = { 0x03, 0x00, 0x04 };
+static uint8_t dataBuffer[8];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,6 +106,7 @@ static void Page1_DrawSensor(void);
 static void Page1_DrawMix(void);
 static void Page1_DrawChannel(Channel ch);
 static void Page1_HandleTouch(uint16_t x, uint16_t y);
+uint16_t CRC16_2(uint8_t *ptr, uint8_t length);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -129,10 +138,10 @@ static void Page1_DrawSensor(void)
 {
   char buf[16];
 
-  Format_1dp(buf, sizeof(buf), temperature, " C ");
+  Format_1dp(buf, sizeof(buf), t, " C ");
   ILI9341_Draw_Text(buf, TEMP_X, TOP_TEXT_Y, TEXT_COLOUR, TOP_TEXT_SIZE, BG_COLOUR);
 
-  Format_1dp(buf, sizeof(buf), humidity, "%RH");
+  Format_1dp(buf, sizeof(buf), h, "%RH");
   ILI9341_Draw_Text(buf, HUMID_X, TOP_TEXT_Y, TEXT_COLOUR, TOP_TEXT_SIZE, BG_COLOUR);
 }
 
@@ -195,6 +204,33 @@ static void Page1_HandleTouch(uint16_t x, uint16_t y)
   }
 }
 
+/* Read the AM2320 into t and h. Returns 1 if the CRC matched. */
+static uint8_t AM2320_Read(void)
+{
+  //Wake up sensor (it NACKs this one while asleep, that is expected)
+  HAL_I2C_Master_Transmit(&hi2c1, AM2320_ADDR, cmdBuffer, 3, 200);
+  //Send reading command
+  HAL_I2C_Master_Transmit(&hi2c1, AM2320_ADDR, cmdBuffer, 3, 200);
+
+  HAL_Delay(1);
+
+  //Receive sensor data
+  HAL_I2C_Master_Receive(&hi2c1, AM2320_ADDR, dataBuffer, 8, 200);
+
+  uint16_t Rcrc = dataBuffer[7] << 8;
+  Rcrc += dataBuffer[6];
+  if (Rcrc != CRC16_2(dataBuffer, 6))
+    return 0;
+
+  uint16_t temperature = ((dataBuffer[4] & 0x7F) << 8) + dataBuffer[5];
+  t = temperature / 10.0;
+  t = (((dataBuffer[4] & 0x80) >> 7) == 1) ? (t * (-1)) : t; // the temperature can be negative
+
+  uint16_t humidity = (dataBuffer[2] << 8) + dataBuffer[3];
+  h = humidity / 10.0;
+  return 1;
+}
+
 /* The touch library is calibrated for SCREEN_VERTICAL_1 (240x320).
    Convert its result into SCREEN_HORIZONTAL_1 (320x240) coordinates. */
 static uint8_t Touch_Read_Landscape(uint16_t *x, uint16_t *y)
@@ -252,18 +288,28 @@ int main(void)
   MX_RNG_Init();
   MX_SPI5_Init();
   MX_TIM1_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   ILI9341_Init();
   ILI9341_Set_Rotation(SCREEN_HORIZONTAL_1);
   Page1_Init();
 
   uint8_t touch_held = 0;
+  uint32_t last_sensor_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* read the AM2320 every AM2320_PERIOD ms without blocking the touch */
+    if (HAL_GetTick() - last_sensor_tick >= AM2320_PERIOD)
+    {
+      last_sensor_tick = HAL_GetTick();
+      if (AM2320_Read())
+        Page1_DrawSensor();
+    }
+
     /* one +10 % step per press: act on the press edge, wait for release */
     if (TP_Touchpad_Pressed())
     {
@@ -304,12 +350,13 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 12;
-  RCC_OscInitStruct.PLL.PLLN = 192;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 200;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 9;
   RCC_OscInitStruct.PLL.PLLR = 2;
@@ -341,7 +388,22 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+uint16_t CRC16_2(uint8_t *ptr, uint8_t length)
+{
+      uint16_t  crc = 0xFFFF;
+      uint8_t   s   = 0x00;
 
+      while(length--) {
+        crc ^= *ptr++;
+        for(s = 0; s < 8; s++) {
+          if((crc & 0x01) != 0) {
+            crc >>= 1;
+            crc ^= 0xA001;
+          } else crc >>= 1;
+        }
+      }
+      return crc;
+}
 /* USER CODE END 4 */
 
 /**
