@@ -41,11 +41,11 @@ All new code is inside the CubeMX `/* USER CODE BEGIN … */` blocks, so it stay
 
 | USER CODE block | What was added |
 |---|---|
-| `Includes` | The ILI9341 driver, GFX and touchscreen headers, and `<stdio.h>` for `snprintf` |
+| `Includes` | The ILI9341 driver, GFX and touchscreen headers, `pic.h` for the photo, and `<stdio.h>` for `snprintf` |
 | `PD` (defines) | Layout positions and sizes, text sizes, the 10% step, pale tint colours, and the AM2320 address and read period |
 | `PV` (variables) | The `Channel` enum, colour tables, the RGB percentages, `t` / `h`, and the AM2320 command and data buffers |
 | `PFP` (prototypes) | Prototypes for the Page 1 functions and `CRC16_2` |
-| `0` (functions) | Helper, drawing, touch and `AM2320_Read()` functions |
+| `0` (functions) | Helper, drawing, touch and `AM2320_Read()` functions, plus `ILI9341_Draw_Custom_Image()` and `Page1_DisplayPhoto()` |
 | `2` (after init) | Start the LCD, rotate it to landscape, draw the first screen, and start the sensor timer |
 | `WHILE` | Main loop: reads the sensor every 3 s and checks for touches (10% once per tap) |
 | `4` | `CRC16_2()` checksum function from the lab sheet |
@@ -262,6 +262,31 @@ static void Page1_HandleTouch(uint16_t x, uint16_t y)
       return;
     }
   }
+
+  /* tap the mix circle to show a photo for 5 s, then restore page 1 as-is */
+  int32_t mix_hit_r = MIX_R + TOUCH_MARGIN;
+  int32_t mdx = (int32_t)x - MIX_X;
+  int32_t mdy = (int32_t)y - MIX_Y;
+  if (mdx * mdx + mdy * mdy <= mix_hit_r * mix_hit_r)
+  {
+    ILI9341_Fill_Screen(BG_COLOUR);
+    Page1_DisplayPhoto();
+
+    /* leave after 5 s, or as soon as the screen is tapped again. The finger
+       that opened the photo has to come up first, or it dismisses it at once. */
+    uint32_t start = HAL_GetTick();
+    uint8_t released = 0;
+
+    while (HAL_GetTick() - start < 5000)
+    {
+      if (!TP_Touchpad_Pressed())
+        released = 1;
+      else if (released)
+        break;
+    }
+
+    Page1_Init();
+  }
 }
 ```
 
@@ -269,6 +294,10 @@ static void Page1_HandleTouch(uint16_t x, uint16_t y)
 - The hit radius is 10 pixels larger than the drawn circle (`TOUCH_MARGIN`), because the resistive touch panel is not very precise.
 - Each hit adds 10%. Going past 100% wraps back to 0%, so the level can be touched round and round.
 - Only the changed bar and the mix circle are redrawn. The library draws circles one pixel at a time, which is slow, so redrawing the whole screen would be too slow.
+- The mix circle is a fourth touch target, checked after the three dots. It uses the same `dx² + dy² ≤ r²` test with the real `MIX_X`, `MIX_Y` and `MIX_R` values, so the tappable area matches the circle that is actually drawn.
+- Tapping it opens the photo (see 4.10). The photo closes by itself after 5 seconds, or earlier if the screen is tapped again.
+- The `released` flag is needed because the finger that opened the photo is usually still on the glass. Without it, that same press would close the photo immediately. The loop waits for the finger to come up first, then treats the next press as "close".
+- `HAL_Delay(5000)` is not used here, because it would block the loop and ignore every touch for the whole 5 seconds.
 
 ```c
 static uint8_t Touch_Read_Landscape(uint16_t *x, uint16_t *y)
@@ -406,10 +435,80 @@ while (1)
   the value goes up when the finger first touches, and nothing more happens until the finger is lifted. Without the flag, holding a finger down would keep adding 10%.
 - The 20 ms delay slows the loop down and helps ignore contact bounce.
 
+### 4.10 Photo display
+
+Tapping the mix circle clears the screen, draws an image from `pic.h`, and writes the group details next to it in the current mix colour.
+
+```c
+static void Page1_DisplayPhoto(void)
+{
+  uint16_t x = (320 - SCREENSHOT_2025_01_12_131834_WIDTH) / 2;
+  uint16_t y = (240 - SCREENSHOT_2025_01_12_131834_HEIGHT) / 2;
+
+  ILI9341_Draw_Custom_Image(x - 80, y,
+                            SCREENSHOT_2025_01_12_131834_WIDTH,
+                            SCREENSHOT_2025_01_12_131834_HEIGHT,
+                            (const char *)Screenshot_2025_01_12_131834);
+
+  uint16_t mix = Mix_Colour();
+
+  ILI9341_Draw_Text("Group No.19", 172, 60,  mix, 2, WHITE);
+  ILI9341_Draw_Text("Nutthakorn",  172, 90,  mix, 2, WHITE);
+  ILI9341_Draw_Text("Thongsamrit", 172, 120, mix, 2, WHITE);
+  ILI9341_Draw_Text("67010280",    172, 150, mix, 2, WHITE);
+}
+```
+
+- The image is smaller than the screen, so `x` and `y` centre it. The `- 80` then shifts it left to leave room for the text on the right.
+- `Mix_Colour()` is called once and reused, so all four lines get the same colour. The text colour follows the R/G/B levels set on page 1. If all three are at 100% the mix is white and the text disappears into the white background.
+
+The image itself is drawn by a small helper:
+
+```c
+void ILI9341_Draw_Custom_Image(uint16_t X, uint16_t Y, uint16_t Width, uint16_t Height, const char* Image_Array)
+{
+  if ((X >= LCD_WIDTH) || (Y >= LCD_HEIGHT)) return;
+  if ((X + Width  - 1) >= LCD_WIDTH)  Width  = LCD_WIDTH  - X;
+  if ((Y + Height - 1) >= LCD_HEIGHT) Height = LCD_HEIGHT - Y;
+
+  ILI9341_Set_Address(X, Y, X + Width - 1, Y + Height - 1);
+
+  uint32_t total_bytes = (uint32_t)Width * Height * 2;
+  for (uint32_t i = 0; i < total_bytes; i++)
+    ILI9341_Write_Data((uint8_t)Image_Array[i]);
+}
+```
+
+- The library's own `ILI9341_Draw_Image` can only draw full screen. This one takes a position and a size, so a small image can be placed anywhere.
+- `ILI9341_Set_Address` opens a rectangle on the panel. Everything sent afterwards fills that rectangle left to right, top to bottom.
+- The bounds are checked against `LCD_WIDTH` and `LCD_HEIGHT` rather than fixed numbers, because those two follow `ILI9341_Set_Rotation`. With `320` and `240` hard-coded, a portrait image would have its height cut to 240.
+- Writing one byte at a time is slower than the library's burst transfer, but it is simple and fast enough for a picture that is only shown for 5 seconds.
+
+**The image array must match the code exactly.** Three things have to line up, and getting any of them wrong produces a picture that cannot be recognised:
+
+| What | Must be |
+| --- | --- |
+| Element type | `uint8_t`. The converter writes one byte per entry (`0x9c,0xd3,...`). Declaring the array `uint16_t` makes every byte take two bytes of flash, so the stream read back byte by byte is meaningless. |
+| Array length | `WIDTH * HEIGHT * 2`. RGB565 uses 2 bytes per pixel. A 120 × 160 picture is 38 400 bytes. |
+| `WIDTH` / `HEIGHT` defines | The real size of the exported picture, not the screen size. |
+
+The width matters most. If a 240-pixel-wide image is drawn into a 320-pixel-wide window, every row starts 80 pixels further right than the one above it, and the picture comes out as a diagonal smear. This is why `snow_tiger.h` (240 × 320, portrait) cannot be drawn in landscape without rotating the panel first:
+
+```c
+ILI9341_Set_Rotation(SCREEN_VERTICAL_1);
+ILI9341_Draw_Custom_Image(0, 0, 240, 320, (const char *)snow_tiger);
+```
+
+`Page1_Init()` has to switch back to `SCREEN_HORIZONTAL_1` afterwards.
+
+> **Note:** `snow_tiger.h` is about 150 KB of flash. Remove the `#include` when the image is not used.
+
 ## 5. Change to the ILI9341 library
 
 In `ILI9341_GFX.h` and `ILI9341_GFX.c`, the `X` and `Y` parameters of `ILI9341_Draw_Char` and `ILI9341_Draw_Text` were changed from `uint8_t` to `uint16_t`.
 A `uint8_t` can only hold 0–255, but the landscape screen is 320 pixels wide. Text on the right side, such as the humidity and percentages starting at X = 188 and 222, would wrap back to the left edge.
+
+In `ILI9341_STM32_Driver.h`, `LCD_WIDTH` and `LCD_HEIGHT` were given `extern` declarations. The driver already keeps these two up to date inside `ILI9341_Set_Rotation`, but they were only visible inside `ILI9341_STM32_Driver.c`. `ILI9341_Draw_Custom_Image` needs them to clip against the current rotation (see 4.10).
 
 ## 6. Differences from the lab sheet example
 
@@ -421,3 +520,7 @@ A `uint8_t` can only hold 0–255, but the landscape screen is 320 pixels wide. 
 
 - **Temperature and humidity stay at `0.0`:** every reading is failing the CRC check. Check the SDA/SCL wiring (PB9/PB8), the power, and the pull-up resistors.
 - **Touch hits the wrong circle:** see the note in 4.6.
+- **The picture comes out as a diagonal smear:** the width used to draw it does not match the width it was exported at. Check the `WIDTH` define against the real size of the picture.
+- **The picture is only right for the first part of the screen, then turns to noise:** the array is shorter than `WIDTH * HEIGHT * 2`, so the code runs off the end of it. Export the picture again at the size the defines claim.
+- **The colours are wrong but the shapes are right:** the two bytes of each pixel are the wrong way round. The panel wants the high byte first.
+- **The text on the photo is invisible:** the mix colour is white, because all three channels are at 100%. Lower one of them.

@@ -133,6 +133,10 @@
 #define SCREEN_VERTICAL_2			2
 #define SCREEN_HORIZONTAL_2		3
 
+/* Track the active rotation, updated by ILI9341_Set_Rotation */
+extern volatile uint16_t LCD_WIDTH;
+extern volatile uint16_t LCD_HEIGHT;
+
 void ILI9341_SPI_Init(void);
 void ILI9341_SPI_Send(unsigned char SPI_Data);
 void ILI9341_Write_Command(uint8_t Command);

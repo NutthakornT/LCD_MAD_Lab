@@ -30,6 +30,8 @@
 #include "ILI9341/ILI9341_STM32_Driver.h"
 #include "ILI9341/ILI9341_GFX.h"
 #include "ILI9341/ILI9341_Touchscreen.h"
+#include "ILI9341/pic.h"
+#include "ILI9341/snow_tiger.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -106,6 +108,7 @@ static void Page1_DrawSensor(void);
 static void Page1_DrawMix(void);
 static void Page1_DrawChannel(Channel ch);
 static void Page1_HandleTouch(uint16_t x, uint16_t y);
+static void Page1_DisplayPhoto(void);
 uint16_t CRC16_2(uint8_t *ptr, uint8_t length);
 /* USER CODE END PFP */
 
@@ -202,7 +205,68 @@ static void Page1_HandleTouch(uint16_t x, uint16_t y)
       return;
     }
   }
+
+  /* tap the mix circle to show a photo for 5 s, then restore page 1 as-is */
+  int32_t mix_hit_r = MIX_R + TOUCH_MARGIN;
+  int32_t mdx = (int32_t)x - MIX_X;
+  int32_t mdy = (int32_t)y - MIX_Y;
+  if (mdx * mdx + mdy * mdy <= mix_hit_r * mix_hit_r)
+  {
+	ILI9341_Fill_Screen(BG_COLOUR);
+    Page1_DisplayPhoto();
+
+    /* leave after 5 s, or as soon as the screen is tapped again. The finger
+       that opened the photo has to come up first, or it dismisses it at once. */
+    uint32_t start = HAL_GetTick();
+    uint8_t released = 0;
+
+    while (HAL_GetTick() - start < 5000)
+    {
+      if (!TP_Touchpad_Pressed())
+        released = 1;
+      else if (released)
+        break;
+    }
+
+    Page1_Init();
+  }
 }
+
+
+void ILI9341_Draw_Custom_Image(uint16_t X, uint16_t Y, uint16_t Width, uint16_t Height, const char* Image_Array) {
+        // 1. ตรวจสอบไม่ให้ขนาดเกินขอบจอ (ตามการหมุนจอปัจจุบัน)
+        if((X >= LCD_WIDTH) || (Y >= LCD_HEIGHT)) return;
+        if((X + Width - 1) >= LCD_WIDTH) Width = LCD_WIDTH - X;
+        if((Y + Height - 1) >= LCD_HEIGHT) Height = LCD_HEIGHT - Y;
+
+        // 2. ล็อกขอบเขตหน้าต่างบนหน้าจอที่จะพ่นสีลงไป
+        ILI9341_Set_Address(X, Y, X + Width - 1, Y + Height - 1);
+
+        // 3. พ่นข้อมูลสีจาก Array เข้าจอผ่าน SPI ทีละไบต์
+        uint32_t total_bytes = (uint32_t)Width * Height * 2;
+        for(uint32_t i = 0; i < total_bytes; i++) {
+            ILI9341_Write_Data((uint8_t)Image_Array[i]);
+        }
+    }
+
+static void Page1_DisplayPhoto(void)
+{
+  uint16_t x = (320 - SCREENSHOT_2025_01_12_131834_WIDTH) / 2;
+  uint16_t y = (240 - SCREENSHOT_2025_01_12_131834_HEIGHT) / 2;
+
+  ILI9341_Draw_Custom_Image(x-80, y,
+                            SCREENSHOT_2025_01_12_131834_WIDTH,
+                            SCREENSHOT_2025_01_12_131834_HEIGHT,
+                            (const char *)Screenshot_2025_01_12_131834);
+
+  uint16_t mix = Mix_Colour();
+
+  ILI9341_Draw_Text("Group No.19", 172, 60,  mix, 2, WHITE);
+  ILI9341_Draw_Text("Nutthakorn",  172, 90,  mix, 2, WHITE);
+  ILI9341_Draw_Text("Thongsamrit", 172, 120, mix, 2, WHITE);
+  ILI9341_Draw_Text("67010280",    172, 150, mix, 2, WHITE);
+}
+
 
 /* Read the AM2320 into t and h. Returns 1 if the CRC matched. */
 static uint8_t AM2320_Read(void)
@@ -314,10 +378,15 @@ int main(void)
     if (TP_Touchpad_Pressed())
     {
       uint16_t x, y;
+
       if (!touch_held && Touch_Read_Landscape(&x, &y))
       {
+    	  char s[20];
+    	  snprintf(s,sizeof(s),"X=%d Y=%d",x,y);
+
         touch_held = 1;
         Page1_HandleTouch(x, y);
+
       }
     }
     else
